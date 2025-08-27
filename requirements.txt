@@ -1,6 +1,6 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
-curl-cffi==0.5.10
+httpx[socks]==0.25.2
 beautifulsoup4==4.12.2
 fake-useragent==1.4.0
 faker==20.1.0
